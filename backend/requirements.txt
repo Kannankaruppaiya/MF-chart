@@ -1,5 +1,12 @@
+# Minimal production requirements for server.py
+# Only packages actually imported by the backend are listed here.
+
 fastapi==0.110.1
-python-dotenv==1.2.2
-httpx==0.28.1
-nselib==2.5.1
+starlette==0.37.2
 uvicorn==0.25.0
+httpx==0.28.1
+python-dotenv==1.2.2
+nselib==2.5.1
+pandas==2.2.3
+numpy==1.26.4
+python-multipart==0.0.9
