@@ -1,0 +1,512 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createChart, LineStyle, CrosshairMode } from "lightweight-charts";
+import { LineChart as LineIcon, CandlestickChart, AreaChart, Settings2, Eye, EyeOff, X } from "lucide-react";
+import { useChartStore } from "../store/chartStore";
+import { buildOHLC } from "../lib/mfapi";
+import { sma, ema, pickSource, applyOffset } from "../lib/indicators";
+import { chartSync, PRICE_SCALE_MIN_WIDTH } from "../lib/chartSync";
+
+const lsToTV = (style) => ({
+  solid: LineStyle.Solid,
+  dashed: LineStyle.Dashed,
+  dotted: LineStyle.Dotted,
+}[style] || LineStyle.Solid);
+
+const visibleRangeDays = {
+  "1D": 1, "5D": 5, "1M": 31, "3M": 93, "6M": 186,
+  YTD: -1, "1Y": 365, "5Y": 365 * 5, All: -2,
+};
+
+export default function ChartPane({ id, style, isBottom, series, loading }) {
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const mainSeriesRef = useRef(null);
+  const overlaySeriesRef = useRef({}); // id → series
+
+  const activeScheme = useChartStore((s) => s.activeScheme);
+  const chartType = useChartStore((s) => s.chartType);
+  const setChartType = useChartStore((s) => s.setChartType);
+  const activeInterval = useChartStore((s) => s.activeInterval);
+  const visibleRange = useChartStore((s) => s.visibleRange);
+  const indicators = useChartStore((s) => s.indicators);
+  const updateIndicator = useChartStore((s) => s.updateIndicator);
+  const removeIndicator = useChartStore((s) => s.removeIndicator);
+  const openSettings = useChartStore((s) => s.openSettings);
+  const activeTool = useChartStore((s) => s.activeTool);
+  const setActiveTool = useChartStore((s) => s.setActiveTool);
+  const pendingPoint = useChartStore((s) => s.pendingPoint);
+  const setPendingPoint = useChartStore((s) => s.setPendingPoint);
+  const drawings = useChartStore((s) => s.drawings);
+  const addDrawing = useChartStore((s) => s.addDrawing);
+  const removeDrawing = useChartStore((s) => s.removeDrawing);
+  const drawingSeriesRef = useRef({}); // id → series or priceLine
+  const [measure, setMeasure] = useState(null);
+
+  const [readout, setReadout] = useState(null);
+
+  const ohlc = useMemo(() => buildOHLC(series), [series]);
+
+  const seriesRef2 = useRef([]);
+  useEffect(() => {
+    seriesRef2.current = chartType === "candle" ? ohlc : series;
+  }, [series, ohlc, chartType]);
+
+  // ---- Setup chart once ----
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const chart = createChart(containerRef.current, {
+      layout: {
+        background: { color: "#131722" },
+        textColor: "#d1d4dc",
+        fontSize: 11,
+        fontFamily: "Inter, sans-serif",
+      },
+      grid: {
+        vertLines: { color: "#1e222d", style: LineStyle.Dashed },
+        horzLines: { color: "#1e222d", style: LineStyle.Dashed },
+      },
+      rightPriceScale: { borderColor: "#363a45", minimumWidth: PRICE_SCALE_MIN_WIDTH },
+      timeScale: { borderColor: "#363a45", timeVisible: false, secondsVisible: false, visible: isBottom },
+      crosshair: { mode: CrosshairMode.Normal },
+      autoSize: false,
+      attributionLogo: false,
+      watermark: {
+        visible: true,
+        fontSize: 24,
+        horzAlign: "center",
+        vertAlign: "center",
+        color: "rgba(255, 255, 255, 0.04)",
+        text: "",
+      },
+    });
+    chartRef.current = chart;
+
+    chart.subscribeCrosshairMove((param) => {
+      if (!param || !param.time || !param.seriesData?.size) {
+        setReadout(null);
+        return;
+      }
+      const v = param.seriesData.get(mainSeriesRef.current);
+      if (!v) return;
+      const val = typeof v === "number" ? v : v.close ?? v.value;
+      setReadout({ time: param.time, value: val });
+    });
+
+    // Click handler for drawing tools (uses latest store state)
+    chart.subscribeClick((param) => {
+      if (!param || !param.time || !mainSeriesRef.current) return;
+      const tool = useChartStore.getState().activeTool;
+      if (tool === "cursor" || tool === "crosshair" || tool === "text") return;
+      // Resolve y price at the clicked event coordinate
+      const point = param.point;
+      if (!point) return;
+      const price = mainSeriesRef.current.coordinateToPrice(point.y);
+      if (price === null) return;
+
+      const pt = { time: param.time, price };
+
+      const pending = useChartStore.getState().pendingPoint;
+      if (tool === "trend" || tool === "ray" || tool === "arrow") {
+        if (!pending) {
+          useChartStore.getState().setPendingPoint(pt);
+        } else {
+          useChartStore.getState().addDrawing({
+            id: String(Date.now()),
+            type: tool,
+            points: [pending, pt],
+            color: "#2962FF",
+            thickness: 2,
+          });
+          useChartStore.getState().setPendingPoint(null);
+          useChartStore.getState().setActiveTool("cursor");
+        }
+      } else if (tool === "horizontal") {
+        useChartStore.getState().addDrawing({
+          id: String(Date.now()),
+          type: tool,
+          points: [pt],
+          color: "#2962FF",
+          thickness: 2,
+        });
+        useChartStore.getState().setActiveTool("cursor");
+      }
+    });
+
+    // Keyboard delete key listener to remove selected drawing
+    const onKey = (e) => {
+      if (e.key === "Delete" || e.key === "Backspace") {
+        const sel = useChartStore.getState().selectedDrawingId;
+        if (sel) {
+          useChartStore.getState().removeDrawing(sel);
+          useChartStore.getState().setSelectedDrawingId(null);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+
+    // Sync: register + push visible logical range changes to sub-panes.
+    chartSync.registerMain(chart, () => mainSeriesRef.current, () => seriesRef2.current, containerRef.current);
+    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      chartSync.syncLogicalRange(chart, range);
+    });
+    chart.subscribeCrosshairMove((param) => {
+      chartSync.syncCrosshair(chart, param);
+    });
+
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (width === 0 || height === 0) continue;
+        chartSync.requestResizeAll();
+      }
+    });
+    ro.observe(containerRef.current);
+
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      ro.disconnect();
+      chartSync.unregisterMain();
+      chart.remove();
+      chartRef.current = null;
+      mainSeriesRef.current = null;
+      overlaySeriesRef.current = {};
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Dynamically update timeScale visibility when isBottom changes
+  useEffect(() => {
+    chartRef.current?.timeScale().applyOptions({ visible: isBottom });
+  }, [isBottom]);
+
+  // Dynamically update watermark text
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const namePart = activeScheme?.name ? activeScheme.name.split(" - ")[0] : "";
+    const shortName = namePart.length > 30 ? namePart.substring(0, 30) + "..." : namePart;
+    chart.applyOptions({
+      watermark: {
+        text: `${shortName} (${activeInterval})`,
+      },
+    });
+  }, [activeScheme, activeInterval]);
+
+  // ---- (Re)create main series whenever chartType changes ----
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (mainSeriesRef.current) {
+      chart.removeSeries(mainSeriesRef.current);
+      mainSeriesRef.current = null;
+    }
+    let s;
+    if (chartType === "candle") {
+      s = chart.addCandlestickSeries({
+        upColor: "#089981", downColor: "#f23645",
+        borderUpColor: "#089981", borderDownColor: "#f23645",
+        wickUpColor: "#089981", wickDownColor: "#f23645",
+      });
+    } else if (chartType === "area") {
+      s = chart.addAreaSeries({
+        lineColor: "#2962FF", topColor: "rgba(41,98,255,0.35)", bottomColor: "rgba(41,98,255,0.02)",
+        lineWidth: 2,
+      });
+    } else {
+      s = chart.addLineSeries({ color: "#2962FF", lineWidth: 2 });
+    }
+    mainSeriesRef.current = s;
+  }, [chartType]);
+
+  // ---- Push data to main series ----
+  useEffect(() => {
+    const s = mainSeriesRef.current;
+    if (!s) return;
+    if (chartType === "candle") s.setData(ohlc);
+    else s.setData(series);
+    if (series.length) chartRef.current?.timeScale().fitContent();
+    chartSync.syncPriceScaleWidths();
+  }, [series, ohlc, chartType]);
+
+  // ---- Overlay indicators (SMA/EMA) ----
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    // Remove deleted
+    const liveIds = new Set(indicators.filter((i) => i.type === "SMA" || i.type === "EMA").map((i) => i.id));
+    for (const id of Object.keys(overlaySeriesRef.current)) {
+      if (!liveIds.has(id)) {
+        try { chart.removeSeries(overlaySeriesRef.current[id]); }
+        catch (err) { console.warn("[ChartPane] removeSeries overlay failed:", err); }
+        delete overlaySeriesRef.current[id];
+      }
+    }
+
+    for (const ind of indicators) {
+      if (ind.type !== "SMA" && ind.type !== "EMA") continue;
+      const showTF = ind.showOnTimeframes || ["1D", "1W", "1M"];
+      const visibleHere = ind.visible && showTF.includes(activeInterval);
+      let s = overlaySeriesRef.current[ind.id];
+      if (!s) {
+        s = chart.addLineSeries({
+          color: ind.color,
+          lineWidth: ind.thickness,
+          lineStyle: lsToTV(ind.lineStyle),
+          priceLineVisible: false,
+          lastValueVisible: false,
+        });
+        overlaySeriesRef.current[ind.id] = s;
+      } else {
+        s.applyOptions({
+          color: ind.color,
+          lineWidth: ind.thickness,
+          lineStyle: lsToTV(ind.lineStyle),
+        });
+      }
+      if (!visibleHere) {
+        s.setData([]);
+        continue;
+      }
+      // Always compute on main series — timeframe override for SMA/EMA uses main bars
+      const sourceOhlc = buildOHLC(series);
+      const values = pickSource(sourceOhlc, ind.source);
+      const fn = ind.type === "SMA" ? sma : ema;
+      const out = fn(values, ind.length);
+      let series2 = series.map((p, i) => {
+        const pt = { time: p.time };
+        if (out[i] != null) {
+          pt.value = out[i];
+        }
+        return pt;
+      });
+      if (ind.offset) series2 = applyOffset(series2, ind.offset);
+      s.setData(series2);
+    }
+    chartSync.syncPriceScaleWidths();
+  }, [indicators, series, activeInterval, chartType]);
+
+  // ---- Crosshair mode follows the "crosshair" tool ----
+  useEffect(() => {
+    chartRef.current?.applyOptions({
+      crosshair: { mode: activeTool === "crosshair" ? CrosshairMode.Magnet : CrosshairMode.Normal },
+    });
+  }, [activeTool]);
+
+  // ---- Render drawings (trendline / hline / ruler) ----
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !mainSeriesRef.current) return;
+    const liveIds = new Set(drawings.map((d) => d.id));
+    // Remove deleted drawings
+    for (const id of Object.keys(drawingSeriesRef.current)) {
+      if (!liveIds.has(id)) {
+        const ref = drawingSeriesRef.current[id];
+        try {
+          if (ref.kind === "series") chart.removeSeries(ref.obj);
+          else if (ref.kind === "priceLine") mainSeriesRef.current.removePriceLine(ref.obj);
+        } catch (err) { console.warn("[ChartPane] remove drawing failed:", err); }
+        delete drawingSeriesRef.current[id];
+      }
+    }
+    // Add new drawings
+    for (const d of drawings) {
+      if (drawingSeriesRef.current[d.id]) continue;
+      if (d.type === "hline") {
+        const pl = mainSeriesRef.current.createPriceLine({
+          price: d.points[0].value,
+          color: d.color,
+          lineWidth: 2,
+          lineStyle: LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: `H @ ${d.points[0].value.toFixed(2)}`,
+        });
+        drawingSeriesRef.current[d.id] = { kind: "priceLine", obj: pl };
+      } else if (d.type === "trendline" || d.type === "ruler") {
+        // Order points ascending by time
+        const pts = [...d.points].sort((a, b) => a.time - b.time);
+        const up = pts[1].value >= pts[0].value;
+        const lineColor = d.type === "ruler" ? (up ? "#089981" : "#f23645") : d.color;
+        const s = chart.addLineSeries({
+          color: lineColor,
+          lineWidth: 2,
+          lineStyle: d.type === "ruler" ? LineStyle.Solid : LineStyle.Solid,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        });
+        s.setData(pts);
+        // Endpoint markers (circles) for both trendline & ruler
+        const markers = [
+          { time: pts[0].time, position: "inBar", color: lineColor, shape: "circle", size: 1 },
+          { time: pts[1].time, position: "inBar", color: lineColor, shape: "circle", size: 1 },
+        ];
+        // For ruler — append measurement label as a text marker at the end point
+        if (d.type === "ruler") {
+          const delta = pts[1].value - pts[0].value;
+          const pct = pts[0].value ? (delta / pts[0].value) * 100 : 0;
+          const t0 = pts[0].time * 1000;
+          const t1 = pts[1].time * 1000;
+          const days = Math.round((t1 - t0) / 86400000);
+          markers.push({
+            time: pts[1].time,
+            position: up ? "aboveBar" : "belowBar",
+            color: lineColor,
+            shape: "arrowRight",
+            text: `${delta >= 0 ? "+" : ""}${delta.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%) · ${days}d`,
+          });
+        }
+        s.setMarkers(markers);
+        drawingSeriesRef.current[d.id] = { kind: "series", obj: s, drawing: d };
+      }
+    }
+    chartSync.syncPriceScaleWidths();
+  }, [drawings]);
+
+  // ---- Apply visibleRange (date range zoom) ----
+  useEffect(() => {
+    if (!series.length || !chartRef.current) return;
+    const ts = chartRef.current.timeScale();
+    const days = visibleRangeDays[visibleRange];
+    if (days === -2 || !days) { ts.fitContent(); return; }
+    if (days === -1) {
+      const yr = new Date().getUTCFullYear();
+      const fromTime = Math.floor(Date.UTC(yr, 0, 1) / 1000);
+      ts.setVisibleRange({ from: fromTime, to: series[series.length - 1].time });
+      return;
+    }
+    const lastTime = series[series.length - 1].time;
+    const lastDate = new Date(lastTime * 1000);
+    const fromDate = new Date(lastDate.getTime() - days * 86400000);
+    const fromTime = Math.floor(fromDate.getTime() / 1000);
+    ts.setVisibleRange({ from: fromTime, to: lastTime });
+  }, [series, visibleRange]);
+
+  const formatDate = (timestamp) => {
+    if (!timestamp) return "";
+    const d = new Date(timestamp * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+  };
+
+  // Compute change for readout — follows crosshair when hovering, else last bar
+  const lastIdx = series.length - 1;
+  const lastBar = series[lastIdx];
+  // Resolve hovered index by matching readout.time to series time
+  let hoverIdx = -1;
+  if (readout?.time && series.length) {
+    hoverIdx = series.findIndex((p) => p.time === readout.time);
+  }
+  const refIdx = hoverIdx >= 0 ? hoverIdx : lastIdx;
+  const cur = series[refIdx];
+  const prev = refIdx > 0 ? series[refIdx - 1] : null;
+  const dayChg = cur && prev ? cur.value - prev.value : 0;
+  const dayChgPct = cur && prev && prev.value ? (dayChg / prev.value) * 100 : 0;
+
+  const overlayInds = indicators.filter((i) => i.type === "SMA" || i.type === "EMA");
+
+  return (
+    <div id={id} style={style} className="chart-pane" data-testid="chart-pane">
+      <div className="chart-controls" data-testid="chart-type-group">
+        <button
+          className={`ct-btn ${chartType === "line" ? "active" : ""}`}
+          onClick={() => setChartType("line")}
+          title="Line chart"
+          data-testid="chart-type-line"
+        >
+          <LineIcon size={14} />
+        </button>
+        <button
+          className={`ct-btn ${chartType === "candle" ? "active" : ""}`}
+          onClick={() => setChartType("candle")}
+          title="Candlestick chart"
+          data-testid="chart-type-candle"
+        >
+          <CandlestickChart size={14} />
+        </button>
+        <button
+          className={`ct-btn ${chartType === "area" ? "active" : ""}`}
+          onClick={() => setChartType("area")}
+          title="Area chart"
+          data-testid="chart-type-area"
+        >
+          <AreaChart size={14} />
+        </button>
+      </div>
+
+      {cur && (
+        <div className="chart-readout" data-testid="chart-readout">
+          <span className="name">{activeScheme?.name?.slice(0, 30)}</span>
+          {" · "}
+          <span className="nav">{(readout?.value ?? cur.value).toFixed(4)}</span>
+          {" "}
+          <span className={`chg ${dayChg >= 0 ? "up" : "down"}`}>
+            {dayChg >= 0 ? "+" : ""}{dayChg.toFixed(4)} ({dayChgPct >= 0 ? "+" : ""}{dayChgPct.toFixed(2)}%)
+          </span>
+          {" · "}
+          <span style={{ color: "var(--tv-text-dim)" }}>{formatDate(cur.time)}</span>
+        </div>
+      )}
+
+      <div className="ind-labels">
+        {overlayInds.map((ind) => (
+          <div key={ind.id} className="ind-chip" data-testid={`ind-chip-${ind.id}`}>
+            <span className="dot" style={{ background: ind.color }} />
+            <span>{ind.type}({ind.length})</span>
+            <button onClick={() => updateIndicator(ind.id, { visible: !ind.visible })} title="Toggle visibility">
+              {ind.visible ? <Eye size={11} /> : <EyeOff size={11} />}
+            </button>
+            <button onClick={() => openSettings(ind.id)} title="Settings"><Settings2 size={11} /></button>
+            <button className="rm" onClick={() => removeIndicator(ind.id)} title="Remove"><X size={11} /></button>
+          </div>
+        ))}
+      </div>
+
+      <div ref={containerRef} className="chart-host"
+           style={{ cursor: activeTool === "cursor" || activeTool === "crosshair" ? "default" : "crosshair" }} />
+
+      {/* Drawing tool status banner */}
+      {activeTool !== "cursor" && activeTool !== "crosshair" && (
+        <div className="tool-banner" data-testid="tool-banner">
+          <span className="dot" style={{ background: activeTool === "trendline" ? "#FF6D00" : activeTool === "ruler" ? "#26A69A" : "#2962FF" }} />
+          <strong>{activeTool === "hline" ? "Horizontal Line" : activeTool === "trendline" ? "Trend Line" : activeTool === "ruler" ? "Ruler" : "Text"}</strong>
+          <span>·&nbsp;
+            {activeTool === "hline" && "Click the chart to place a horizontal line."}
+            {activeTool === "trendline" && (pendingPoint ? "Click the second point to draw the line." : "Click the first point.")}
+            {activeTool === "ruler" && (pendingPoint ? "Click the second point to measure." : "Click the first point.")}
+            {activeTool === "text" && "Text annotations are coming soon."}
+          </span>
+          <button onClick={() => { setActiveTool("cursor"); setPendingPoint(null); }} title="Cancel (Esc)">
+            <X size={11} />
+          </button>
+        </div>
+      )}
+
+      {/* Drawings list (right side, below indicators) */}
+      {drawings.length > 0 && (
+        <div className="drawings-list" data-testid="drawings-list">
+          {drawings.map((d) => {
+            const isRuler = d.type === "ruler";
+            const up = isRuler && d.points[1].value >= d.points[0].value;
+            const dotColor = isRuler ? (up ? "#089981" : "#f23645") : d.color;
+            const label =
+              d.type === "hline" ? `Hline @ ${d.points[0].value.toFixed(2)}` :
+              d.type === "trendline" ? `Trend ${d.points[0].value.toFixed(2)}→${d.points[1].value.toFixed(2)}` :
+              `Ruler Δ${(d.points[1].value - d.points[0].value).toFixed(2)} (${(((d.points[1].value - d.points[0].value)/d.points[0].value)*100).toFixed(2)}%)`;
+            return (
+              <div key={d.id} className="ind-chip" data-testid={`drawing-${d.id}`}>
+                <span className="dot" style={{ background: dotColor }} />
+                <span>{label}</span>
+                <button className="rm" onClick={() => removeDrawing(d.id)} title="Remove">
+                  <X size={11} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {loading && (
+        <div className="chart-loading"><div className="spinner" /></div>
+      )}
+    </div>
+  );
+}
