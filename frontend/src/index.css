@@ -522,6 +522,11 @@ input, select {
 .picker-card:hover { background: var(--tv-bg4); border-color: var(--tv-blue); }
 .picker-card .pc-name { font-weight: 600; color: var(--tv-text); margin-bottom: 2px; }
 .picker-card .pc-desc { color: var(--tv-text-dim); font-size: 11px; }
+.picker-section-label {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--tv-text-dim); padding: 4px 0 6px;
+}
+
 
 /* Animations */
 @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }

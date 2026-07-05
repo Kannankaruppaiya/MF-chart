@@ -1,9 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createChart, LineStyle, CrosshairMode } from "lightweight-charts";
-import { LineChart as LineIcon, CandlestickChart, AreaChart, Settings2, Eye, EyeOff, X } from "lucide-react";
+import { LineChart as LineIcon, CandlestickChart, AreaChart, BrickWall, Waves, Settings2, Eye, EyeOff, X } from "lucide-react";
 import { useChartStore } from "../store/chartStore";
 import { buildOHLC } from "../lib/mfapi";
-import { sma, ema, pickSource, applyOffset } from "../lib/indicators";
+import {
+  sma, ema, wma, bollingerBands, vwap, psar, keltnerChannels, chandelierExit, ichimokuCloud,
+  pickSource, applyOffset,
+} from "../lib/indicators";
+import { detectAllPatterns } from "../lib/candlePatterns";
+import { renko, heikinAshi } from "../lib/chartTypes";
 import { chartSync, PRICE_SCALE_MIN_WIDTH } from "../lib/chartSync";
 
 const lsToTV = (style) => ({
@@ -46,10 +51,19 @@ export default function ChartPane({ id, style, isBottom, series, loading }) {
 
   const ohlc = useMemo(() => buildOHLC(series), [series]);
 
+  // Renko / Heikin-Ashi are alternate candle renderings of the same OHLC data,
+  // selected via the same chart-type toggle as line/candle/area.
+  const isCandleLike = chartType === "candle" || chartType === "renko" || chartType === "heikinashi";
+  const displayOhlc = useMemo(() => {
+    if (chartType === "renko") return renko(ohlc);
+    if (chartType === "heikinashi") return heikinAshi(ohlc);
+    return ohlc;
+  }, [ohlc, chartType]);
+
   const seriesRef2 = useRef([]);
   useEffect(() => {
-    seriesRef2.current = chartType === "candle" ? ohlc : series;
-  }, [series, ohlc, chartType]);
+    seriesRef2.current = isCandleLike ? displayOhlc : series;
+  }, [series, displayOhlc, isCandleLike]);
 
   // ---- Setup chart once ----
   useEffect(() => {
@@ -103,10 +117,20 @@ export default function ChartPane({ id, style, isBottom, series, loading }) {
       const price = mainSeriesRef.current.coordinateToPrice(point.y);
       if (price === null) return;
 
-      const pt = { time: param.time, price };
+      // Bug fix: the drawings-render effect and drawings-list panel below both
+      // read `.value` off each point (e.g. `d.points[0].value.toFixed(2)`), not
+      // `.price` — storing under `price` here caused a crash ("Cannot read
+      // properties of undefined (reading 'toFixed')") as soon as a drawing was
+      // actually placed.
+      const pt = { time: param.time, value: price };
 
       const pending = useChartStore.getState().pendingPoint;
-      if (tool === "trend" || tool === "ray" || tool === "arrow") {
+      // Bug fix: these must match DrawToolRail's actual tool ids ("trendline"/
+      // "ruler"/"hline") and the drawings-render effect below, which expect
+      // the same strings. The previous checks ("trend"/"ray"/"arrow"/
+      // "horizontal") never matched any real tool id, so no click tool ever
+      // placed a drawing.
+      if (tool === "trendline" || tool === "ruler") {
         if (!pending) {
           useChartStore.getState().setPendingPoint(pt);
         } else {
@@ -120,7 +144,7 @@ export default function ChartPane({ id, style, isBottom, series, loading }) {
           useChartStore.getState().setPendingPoint(null);
           useChartStore.getState().setActiveTool("cursor");
         }
-      } else if (tool === "horizontal") {
+      } else if (tool === "hline") {
         useChartStore.getState().addDrawing({
           id: String(Date.now()),
           type: tool,
@@ -201,7 +225,7 @@ export default function ChartPane({ id, style, isBottom, series, loading }) {
       mainSeriesRef.current = null;
     }
     let s;
-    if (chartType === "candle") {
+    if (chartType === "candle" || chartType === "renko" || chartType === "heikinashi") {
       s = chart.addCandlestickSeries({
         upColor: "#089981", downColor: "#f23645",
         borderUpColor: "#089981", borderDownColor: "#f23645",
@@ -222,66 +246,211 @@ export default function ChartPane({ id, style, isBottom, series, loading }) {
   useEffect(() => {
     const s = mainSeriesRef.current;
     if (!s) return;
-    if (chartType === "candle") s.setData(ohlc);
+    if (isCandleLike) s.setData(displayOhlc);
     else s.setData(series);
     if (series.length) chartRef.current?.timeScale().fitContent();
     chartSync.syncPriceScaleWidths();
-  }, [series, ohlc, chartType]);
+  }, [series, displayOhlc, isCandleLike]);
 
-  // ---- Overlay indicators (SMA/EMA) ----
+  // ---- Overlay indicators (SMA / EMA / WMA / BBANDS / VWAP / PSAR / KELT / CHANDELIER / ICHIMOKU / CANDLE_PAT) ----
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
-    // Remove deleted
-    const liveIds = new Set(indicators.filter((i) => i.type === "SMA" || i.type === "EMA").map((i) => i.id));
-    for (const id of Object.keys(overlaySeriesRef.current)) {
-      if (!liveIds.has(id)) {
-        try { chart.removeSeries(overlaySeriesRef.current[id]); }
+    const OVERLAY_TYPES = new Set([
+      "SMA", "EMA", "WMA", "BBANDS", "VWAP", "PSAR", "KELT", "CHANDELIER", "ICHIMOKU", "CANDLE_PAT",
+    ]);
+    const MULTI_KEYS = {
+      BBANDS: [":upper", ":lower"],
+      KELT: [":upper", ":lower"],
+      CHANDELIER: [":long", ":short"],
+      ICHIMOKU: [":base", ":spanA", ":spanB"],
+    };
+
+    // Collect all live series keys for overlay indicators
+    const liveKeys = new Set();
+    for (const ind of indicators) {
+      if (!OVERLAY_TYPES.has(ind.type)) continue;
+      if (ind.type === "CANDLE_PAT") continue; // rendered as markers, not a series
+      if (ind.type === "CHANDELIER") {
+        liveKeys.add(ind.id + ":long");
+        liveKeys.add(ind.id + ":short");
+      } else {
+        liveKeys.add(ind.id);
+        for (const suffix of MULTI_KEYS[ind.type] || []) liveKeys.add(ind.id + suffix);
+      }
+    }
+    // Remove deleted series
+    for (const key of Object.keys(overlaySeriesRef.current)) {
+      if (!liveKeys.has(key)) {
+        try { chart.removeSeries(overlaySeriesRef.current[key]); }
         catch (err) { console.warn("[ChartPane] removeSeries overlay failed:", err); }
-        delete overlaySeriesRef.current[id];
+        delete overlaySeriesRef.current[key];
       }
     }
 
-    for (const ind of indicators) {
-      if (ind.type !== "SMA" && ind.type !== "EMA") continue;
-      const showTF = ind.showOnTimeframes || ["1D", "1W", "1M"];
-      const visibleHere = ind.visible && showTF.includes(activeInterval);
-      let s = overlaySeriesRef.current[ind.id];
+    const sourceOhlc = buildOHLC(series);
+    const patternMarkers = [];
+
+    const ensureLine = (key, color, width, style) => {
+      let s = overlaySeriesRef.current[key];
       if (!s) {
         s = chart.addLineSeries({
-          color: ind.color,
-          lineWidth: ind.thickness,
-          lineStyle: lsToTV(ind.lineStyle),
-          priceLineVisible: false,
-          lastValueVisible: false,
+          color, lineWidth: width, lineStyle: style,
+          priceLineVisible: false, lastValueVisible: false,
         });
-        overlaySeriesRef.current[ind.id] = s;
+        overlaySeriesRef.current[key] = s;
       } else {
-        s.applyOptions({
-          color: ind.color,
-          lineWidth: ind.thickness,
-          lineStyle: lsToTV(ind.lineStyle),
-        });
+        s.applyOptions({ color, lineWidth: width, lineStyle: style });
       }
-      if (!visibleHere) {
-        s.setData([]);
+      return s;
+    };
+
+    for (const ind of indicators) {
+      if (!OVERLAY_TYPES.has(ind.type)) continue;
+      const showTF = ind.showOnTimeframes || ["1D", "1W", "1M"];
+      const visibleHere = ind.visible && showTF.includes(activeInterval);
+
+      // ── SMA / EMA / WMA ────────────────────────────────────────
+      if (ind.type === "SMA" || ind.type === "EMA" || ind.type === "WMA") {
+        const s = ensureLine(ind.id, ind.color, ind.thickness, lsToTV(ind.lineStyle));
+        if (!visibleHere) { s.setData([]); continue; }
+        const values = pickSource(sourceOhlc, ind.source);
+        const fn = ind.type === "SMA" ? sma : ind.type === "EMA" ? ema : wma;
+        const out = fn(values, ind.length);
+        let pts = series.map((p, i) => ({ time: p.time, ...(out[i] != null ? { value: out[i] } : {}) }));
+        if (ind.offset) pts = applyOffset(pts, ind.offset);
+        s.setData(pts);
         continue;
       }
-      // Always compute on main series — timeframe override for SMA/EMA uses main bars
-      const sourceOhlc = buildOHLC(series);
-      const values = pickSource(sourceOhlc, ind.source);
-      const fn = ind.type === "SMA" ? sma : ema;
-      const out = fn(values, ind.length);
-      let series2 = series.map((p, i) => {
-        const pt = { time: p.time };
-        if (out[i] != null) {
-          pt.value = out[i];
+
+      // ── BBANDS ─────────────────────────────────────────────────
+      if (ind.type === "BBANDS") {
+        const keys   = [ind.id, ind.id + ":upper", ind.id + ":lower"];
+        const colors = [ind.color, ind.color2 || "#26A69A", ind.color2 || "#26A69A"];
+        keys.forEach((key, ki) => ensureLine(
+          key, colors[ki], ki === 0 ? ind.thickness : 1,
+          ki === 0 ? lsToTV(ind.lineStyle) : LineStyle.Dashed,
+        ));
+        if (!visibleHere) { keys.forEach(k => overlaySeriesRef.current[k]?.setData([])); continue; }
+        const values = pickSource(sourceOhlc, ind.source);
+        const bbOut = bollingerBands(values, ind.length, 2);
+        overlaySeriesRef.current[ind.id]           .setData(series.map((p, i) => ({ time: p.time, ...(bbOut[i] ? { value: bbOut[i].middle } : {}) })));
+        overlaySeriesRef.current[ind.id + ":upper"].setData(series.map((p, i) => ({ time: p.time, ...(bbOut[i] ? { value: bbOut[i].upper  } : {}) })));
+        overlaySeriesRef.current[ind.id + ":lower"].setData(series.map((p, i) => ({ time: p.time, ...(bbOut[i] ? { value: bbOut[i].lower  } : {}) })));
+        continue;
+      }
+
+      // ── VWAP ───────────────────────────────────────────────────
+      if (ind.type === "VWAP") {
+        const s = ensureLine(ind.id, ind.color, ind.thickness, lsToTV(ind.lineStyle));
+        if (!visibleHere) { s.setData([]); continue; }
+        const vwapOut = vwap(
+          sourceOhlc.map(b => b.high), sourceOhlc.map(b => b.low),
+          sourceOhlc.map(b => b.close), sourceOhlc.map(b => b.volume ?? 1),
+        );
+        s.setData(series.map((p, i) => ({ time: p.time, ...(vwapOut[i] != null ? { value: vwapOut[i] } : {}) })));
+        continue;
+      }
+
+      // ── PSAR ───────────────────────────────────────────────────
+      if (ind.type === "PSAR") {
+        let s = overlaySeriesRef.current[ind.id];
+        if (!s) {
+          s = chart.addLineSeries({
+            color: ind.color, lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 2,
+            priceLineVisible: false, lastValueVisible: false,
+          });
+          overlaySeriesRef.current[ind.id] = s;
+        } else {
+          s.applyOptions({ color: ind.color });
         }
-        return pt;
-      });
-      if (ind.offset) series2 = applyOffset(series2, ind.offset);
-      s.setData(series2);
+        if (!visibleHere) { s.setData([]); continue; }
+        const psarOut = psar(sourceOhlc.map(b => b.high), sourceOhlc.map(b => b.low));
+        s.setData(series.map((p, i) => ({ time: p.time, ...(psarOut[i] != null ? { value: psarOut[i] } : {}) })));
+        continue;
+      }
+
+      // ── Keltner Channels ─────────────────────────────────────────
+      if (ind.type === "KELT") {
+        const keys   = [ind.id, ind.id + ":upper", ind.id + ":lower"];
+        const colors = [ind.color, ind.color2 || "#00BCD4", ind.color2 || "#00BCD4"];
+        keys.forEach((key, ki) => ensureLine(
+          key, colors[ki], ki === 0 ? ind.thickness : 1,
+          ki === 0 ? lsToTV(ind.lineStyle) : LineStyle.Dashed,
+        ));
+        if (!visibleHere) { keys.forEach(k => overlaySeriesRef.current[k]?.setData([])); continue; }
+        const keltOut = keltnerChannels(
+          sourceOhlc.map(b => b.high), sourceOhlc.map(b => b.low), sourceOhlc.map(b => b.close), ind.length,
+        );
+        overlaySeriesRef.current[ind.id]           .setData(series.map((p, i) => ({ time: p.time, ...(keltOut[i] ? { value: keltOut[i].middle } : {}) })));
+        overlaySeriesRef.current[ind.id + ":upper"].setData(series.map((p, i) => ({ time: p.time, ...(keltOut[i] ? { value: keltOut[i].upper  } : {}) })));
+        overlaySeriesRef.current[ind.id + ":lower"].setData(series.map((p, i) => ({ time: p.time, ...(keltOut[i] ? { value: keltOut[i].lower  } : {}) })));
+        continue;
+      }
+
+      // ── Chandelier Exit (long/short stop lines) ──────────────────
+      if (ind.type === "CHANDELIER") {
+        const keys   = [ind.id + ":long", ind.id + ":short"];
+        const colors = [ind.color, ind.color2 || "#F44336"];
+        keys.forEach((key, ki) => ensureLine(key, colors[ki], ind.thickness, LineStyle.Dashed));
+        if (!visibleHere) { keys.forEach(k => overlaySeriesRef.current[k]?.setData([])); continue; }
+        const chOut = chandelierExit(
+          sourceOhlc.map(b => b.high), sourceOhlc.map(b => b.low), sourceOhlc.map(b => b.close), ind.length,
+        );
+        overlaySeriesRef.current[ind.id + ":long"] .setData(series.map((p, i) => ({ time: p.time, ...(chOut[i] ? { value: chOut[i].exitLong  } : {}) })));
+        overlaySeriesRef.current[ind.id + ":short"].setData(series.map((p, i) => ({ time: p.time, ...(chOut[i] ? { value: chOut[i].exitShort } : {}) })));
+        continue;
+      }
+
+      // ── Ichimoku Cloud (conversion / base / spanA / spanB) ────────
+      if (ind.type === "ICHIMOKU") {
+        const keys   = [ind.id, ind.id + ":base", ind.id + ":spanA", ind.id + ":spanB"];
+        const colors = [ind.color, ind.color2 || "#FF5722", ind.color3 || "#9C27B0", ind.color4 || "#4CAF50"];
+        keys.forEach((key, ki) => ensureLine(key, colors[ki], 1, LineStyle.Solid));
+        if (!visibleHere) { keys.forEach(k => overlaySeriesRef.current[k]?.setData([])); continue; }
+        const ichOut = ichimokuCloud(sourceOhlc.map(b => b.high), sourceOhlc.map(b => b.low), ind.length);
+        overlaySeriesRef.current[ind.id]            .setData(series.map((p, i) => ({ time: p.time, ...(ichOut[i] ? { value: ichOut[i].conversion } : {}) })));
+        overlaySeriesRef.current[ind.id + ":base"]  .setData(series.map((p, i) => ({ time: p.time, ...(ichOut[i] ? { value: ichOut[i].base       } : {}) })));
+        overlaySeriesRef.current[ind.id + ":spanA"] .setData(series.map((p, i) => ({ time: p.time, ...(ichOut[i] ? { value: ichOut[i].spanA      } : {}) })));
+        overlaySeriesRef.current[ind.id + ":spanB"] .setData(series.map((p, i) => ({ time: p.time, ...(ichOut[i] ? { value: ichOut[i].spanB      } : {}) })));
+        continue;
+      }
+
+      // ── Candlestick pattern markers ───────────────────────────────
+      if (ind.type === "CANDLE_PAT") {
+        if (!visibleHere) continue;
+        const hits = detectAllPatterns({
+          open: sourceOhlc.map(b => b.open), high: sourceOhlc.map(b => b.high),
+          low: sourceOhlc.map(b => b.low), close: sourceOhlc.map(b => b.close),
+        });
+        // Bars here are synthesized from a single daily NAV value (no real
+        // intraday OHLC), so every bar has zero wick/shadow by construction.
+        // Wick-dependent patterns (Tweezer, Doji, Hammer, ...) can legitimately
+        // fire on most local reversal points as a result. We keep the detector
+        // math untouched (it matches the source) but drop inline text labels
+        // and cap to one marker per bar, so a long, active range still renders
+        // as readable shapes instead of overlapping label soup.
+        const seenBarTimes = new Set();
+        for (const hit of hits) {
+          const bar = series[hit.index];
+          if (!bar || seenBarTimes.has(bar.time)) continue;
+          seenBarTimes.add(bar.time);
+          patternMarkers.push({
+            time: bar.time,
+            position: hit.sentiment === "bearish" ? "aboveBar" : "belowBar",
+            color: hit.sentiment === "bullish" ? "#089981" : hit.sentiment === "bearish" ? "#f23645" : "#787b86",
+            shape: hit.sentiment === "bullish" ? "arrowUp" : hit.sentiment === "bearish" ? "arrowDown" : "circle",
+          });
+        }
+        continue;
+      }
     }
+
+    if (mainSeriesRef.current) {
+      patternMarkers.sort((a, b) => a.time - b.time);
+      mainSeriesRef.current.setMarkers(patternMarkers);
+    }
+
     chartSync.syncPriceScaleWidths();
   }, [indicators, series, activeInterval, chartType]);
 
@@ -401,7 +570,9 @@ export default function ChartPane({ id, style, isBottom, series, loading }) {
   const dayChg = cur && prev ? cur.value - prev.value : 0;
   const dayChgPct = cur && prev && prev.value ? (dayChg / prev.value) * 100 : 0;
 
-  const overlayInds = indicators.filter((i) => i.type === "SMA" || i.type === "EMA");
+  const overlayInds = indicators.filter((i) =>
+    ["SMA", "EMA", "WMA", "BBANDS", "VWAP", "PSAR", "KELT", "CHANDELIER", "ICHIMOKU", "CANDLE_PAT"].includes(i.type)
+  );
 
   return (
     <div id={id} style={style} className="chart-pane" data-testid="chart-pane">
@@ -429,6 +600,22 @@ export default function ChartPane({ id, style, isBottom, series, loading }) {
           data-testid="chart-type-area"
         >
           <AreaChart size={14} />
+        </button>
+        <button
+          className={`ct-btn ${chartType === "renko" ? "active" : ""}`}
+          onClick={() => setChartType("renko")}
+          title="Renko chart"
+          data-testid="chart-type-renko"
+        >
+          <BrickWall size={14} />
+        </button>
+        <button
+          className={`ct-btn ${chartType === "heikinashi" ? "active" : ""}`}
+          onClick={() => setChartType("heikinashi")}
+          title="Heikin-Ashi chart"
+          data-testid="chart-type-heikinashi"
+        >
+          <Waves size={14} />
         </button>
       </div>
 
