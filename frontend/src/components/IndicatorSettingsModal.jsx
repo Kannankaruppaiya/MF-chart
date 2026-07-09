@@ -12,10 +12,10 @@ const SOURCES = [
   { v: "ohlc4", label: "OHLC4" },
 ];
 const TIMEFRAMES = [
-  { v: "", label: "Inherit chart interval" },
-  { v: "1D", label: "1D — Daily" },
-  { v: "1W", label: "1W — Weekly" },
-  { v: "1M", label: "1M — Monthly" },
+  { v: "", label: "Chart" },
+  { v: "1D", label: "1 day" },
+  { v: "1W", label: "1 week" },
+  { v: "1M", label: "1 month" },
 ];
 const TFS = ["1D", "1W", "1M"];
 
@@ -86,8 +86,12 @@ export default function IndicatorSettingsModal() {
                     data-testid="setting-offset"
                   />
                 </div>
+              </div>
+
+              <div className="picker-section-label" style={{ marginTop: 14 }}>Calculation</div>
+              <div className="field-row">
                 <div className="field">
-                  <label>Timeframe override</label>
+                  <label>Timeframe</label>
                   <select
                     value={ind.timeframe || ""}
                     onChange={(e) => set({ timeframe: e.target.value || undefined })}
@@ -101,7 +105,7 @@ export default function IndicatorSettingsModal() {
                 <label className="field-checkbox">
                   <input
                     type="checkbox"
-                    checked={!!ind.waitForClose}
+                    checked={ind.waitForClose !== false}
                     onChange={(e) => set({ waitForClose: e.target.checked })}
                     data-testid="setting-wait-close"
                   />

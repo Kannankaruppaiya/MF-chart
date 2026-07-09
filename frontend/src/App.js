@@ -74,11 +74,7 @@ function App() {
   const persistedWeights = useChartStore((s) => s.paneWeights) || EMPTY_OBJ;
   const setPaneWeights = useChartStore((s) => s.setPaneWeights);
 
-  const SUB_PANE_TYPES = new Set([
-    "ROC", "RSI", "MACD", "ATR", "STOCH", "ADX", "WPCTR", "OBV",
-    // New oscillators
-    "CCI", "AO", "MFI", "ADL", "FORCEIDX", "STOCHRSI", "TRIX", "KST",
-  ]);
+  const SUB_PANE_TYPES = new Set(["ROC", "RSI"]);
   const subPaneIndicators = indicators.filter((i) => SUB_PANE_TYPES.has(i.type));
   const activePaneIds = useMemo(() => ["main", ...subPaneIndicators.map((i) => i.id)], [subPaneIndicators]);
 

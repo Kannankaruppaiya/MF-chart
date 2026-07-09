@@ -4,7 +4,37 @@
 // our existing {time, open, high, low, close, volume} bar-array shape.
 // See vendor/technicalindicators-LICENSE.
 
-import { atr } from "./indicators";
+/**
+ * Internal ATR(period) — Wilder's average of True Range, used only to pick a
+ * sensible default Renko brick size. Not exposed as a chart indicator.
+ */
+function atr(highs, lows, closes, period) {
+  const n = highs.length;
+  const out = new Array(n).fill(null);
+  if (n < period + 1) return out;
+  let sum = 0;
+  let count = 0;
+  let prev = null;
+  for (let i = 1; i < n; i++) {
+    const tr = Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i] - closes[i - 1])
+    );
+    if (prev === null) {
+      sum += tr;
+      count++;
+      if (count === period) {
+        prev = sum / period;
+        out[i] = prev;
+      }
+    } else {
+      prev = prev + (tr - prev) / period;
+      out[i] = prev;
+    }
+  }
+  return out;
+}
 
 /**
  * Renko — converts an OHLC series into fixed brick-size bars.

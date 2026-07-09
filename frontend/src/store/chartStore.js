@@ -5,38 +5,15 @@ const WATCHLIST_MAX = 20;
 
 const nextId = () => `ind-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
 
+// Supported indicators: SMA/EMA overlays on the price pane, ROC/RSI sub-panes.
 const defaultsByType = {
-  SMA:    { length: 20,  color: "#2962FF" },
-  EMA:    { length: 50,  color: "#FF6D00" },
-  ROC:    { length: 9,   color: "#26A69A" },
-  RSI:    { length: 14,  color: "#AB47BC" },
-  // Pre-existing indicators
-  MACD:   { length: 26,  color: "#2962FF",  color2: "#FF6D00",  color3: "#26A69A" },
-  BBANDS: { length: 20,  color: "#2962FF",  color2: "#26A69A",  color3: "#26A69A" },
-  ATR:    { length: 14,  color: "#F06292" },
-  STOCH:  { length: 14,  color: "#2962FF",  color2: "#FF6D00" },
-  ADX:    { length: 14,  color: "#2962FF",  color2: "#26A69A",  color3: "#F06292" },
-  WPCTR:  { length: 14,  color: "#AB47BC" },
-  OBV:    { length: 1,   color: "#26C6DA" },
-  VWAP:   { length: 1,   color: "#E040FB" },
-  // New overlay indicators
-  WMA:         { length: 20,  color: "#FF9800" },
-  PSAR:        { length: 1,   color: "#E91E63" },
-  KELT:        { length: 20,  color: "#00BCD4",  color2: "#00BCD4" },
-  CHANDELIER:  { length: 22,  color: "#4CAF50",  color2: "#F44336" },
-  ICHIMOKU:    { length: 9,   color: "#2196F3",  color2: "#FF5722",  color3: "#9C27B0",  color4: "#4CAF50" },
-  // New oscillator indicators
-  CCI:         { length: 20,  color: "#FF9800" },
-  AO:          { length: 5,   color: "#00BCD4" },
-  MFI:         { length: 14,  color: "#E040FB" },
-  ADL:         { length: 1,   color: "#26C6DA" },
-  FORCEIDX:    { length: 13,  color: "#F06292" },
-  STOCHRSI:    { length: 14,  color: "#2962FF",  color2: "#FF6D00" },
-  TRIX:        { length: 18,  color: "#AB47BC" },
-  KST:         { length: 10,  color: "#26A69A",  color2: "#FF9800" },
-  // Candlestick patterns (overlay on price pane, no sub-pane)
-  CANDLE_PAT:  { length: 1,   color: "#FFD700" },
+  SMA: { length: 20, color: "#2962FF" },
+  EMA: { length: 50, color: "#FF6D00" },
+  ROC: { length: 9,  color: "#26A69A" },
+  RSI: { length: 14, color: "#AB47BC" },
 };
+
+export const INDICATOR_TYPES = Object.keys(defaultsByType);
 
 const makeIndicator = (type) => ({
   id: nextId(),
@@ -44,9 +21,6 @@ const makeIndicator = (type) => ({
   length: defaultsByType[type].length,
   source: "close",
   color: defaultsByType[type].color,
-  color2: defaultsByType[type].color2 || undefined,
-  color3: defaultsByType[type].color3 || undefined,
-  color4: defaultsByType[type].color4 || undefined,
   lineStyle: "solid",
   // Default to a thin 1px line (matches TradingView's default indicator
   // weight). A thicker stroke visually rounds off sharp peaks/troughs on
@@ -54,10 +28,12 @@ const makeIndicator = (type) => ({
   // at 1px vs 2px on the same data. Still user-adjustable via Settings > Style.
   thickness: 1,
   visible: true,
-  timeframe: undefined,
   showOnTimeframes: ["1D", "1W", "1M"],
-  waitForClose: false,
   offset: 0,
+  // Calculation timeframe (TradingView-style MTF): undefined = chart interval.
+  // waitForClose: only emit confirmed values at higher-timeframe closes.
+  timeframe: undefined,
+  waitForClose: true,
 });
 
 
@@ -99,7 +75,10 @@ export const useChartStore = create(
 
       // Indicators
       indicators: [],
-      addIndicator: (type) => set({ indicators: [...get().indicators, makeIndicator(type)] }),
+      addIndicator: (type) => {
+        if (!defaultsByType[type]) return;
+        set({ indicators: [...get().indicators, makeIndicator(type)] });
+      },
       removeIndicator: (id) =>
         set({ indicators: get().indicators.filter((ind) => ind.id !== id) }),
       updateIndicator: (id, patch) =>
@@ -129,6 +108,25 @@ export const useChartStore = create(
     }),
     {
       name: "mf-chart-store",
+      version: 3,
+      // v3: only SMA/EMA/ROC/RSI survive; drop removed indicator types and
+      // their multi-line colors from previously persisted sessions, plus pane
+      // weights for panes that no longer exist.
+      migrate: (persisted) => {
+        if (!persisted) return persisted;
+        const indicators = (persisted.indicators || [])
+          .filter((ind) => defaultsByType[ind.type])
+          .map(({ color2, color3, color4, ...rest }) => ({
+            waitForClose: true,
+            ...rest,
+          }));
+        const liveIds = new Set(["main", ...indicators.map((i) => i.id)]);
+        const paneWeights = {};
+        for (const [k, v] of Object.entries(persisted.paneWeights || {})) {
+          if (liveIds.has(k)) paneWeights[k] = v;
+        }
+        return { ...persisted, indicators, paneWeights };
+      },
       partialize: (state) => ({
         watchlist: state.watchlist,
         chartType: state.chartType,

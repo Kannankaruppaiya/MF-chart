@@ -16,7 +16,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 import httpx
-from nselib import capital_market as nse_cm
+
+# nselib is optional — NSE endpoints return empty/503 without it, but the core
+# mutual-fund API must not crash at import time when it isn't installed.
+try:
+    from nselib import capital_market as nse_cm
+except ImportError:
+    nse_cm = None
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -96,6 +102,9 @@ NSE_READY = False
 async def load_nse_equity_list():
     """Background: load NSE equity list once at startup."""
     global NSE_EQUITY_LIST, NSE_READY
+    if nse_cm is None:
+        logger.warning("[nse] nselib not installed — NSE endpoints disabled")
+        return
     loop = asyncio.get_event_loop()
     try:
         df = await loop.run_in_executor(None, nse_cm.equity_list)
@@ -170,6 +179,8 @@ async def nse_history(symbol: str, period: str = "1Y"):
 
     period: 1M | 3M | 6M | 1Y | 5Y (default 1Y).
     """
+    if nse_cm is None:
+        raise HTTPException(status_code=503, detail="NSE support unavailable (nselib not installed)")
     period = period.upper()
     days_map = {"1M": 31, "3M": 93, "6M": 186, "1Y": 365, "5Y": 365 * 5}
     days = days_map.get(period, 365)

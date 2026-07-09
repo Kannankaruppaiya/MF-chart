@@ -19,6 +19,20 @@ function monthKey(timestamp) {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
+/**
+ * Bucket key for a timestamp at a given interval — bars sharing a key belong
+ * to the same 1D / 1W / 1M period. Used by the multi-timeframe indicator
+ * engine to group chart bars into higher-timeframe bars.
+ */
+export function bucketKey(timestamp, interval) {
+  if (interval === "1M") return monthKey(timestamp);
+  if (interval === "1W") return isoWeekKey(timestamp);
+  const d = new Date(timestamp * 1000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(
+    d.getUTCDate()
+  ).padStart(2, "0")}`;
+}
+
 export function resampleNavSeries(series, interval) {
   if (!series.length || interval === "1D") return series;
   const keyFn = interval === "1W" ? isoWeekKey : monthKey;
